@@ -17,9 +17,22 @@ import win32api
 import queue
 import sys
 import json
+import subprocess
+import multiprocessing
+
+
+# 创建无窗口的进程
+DETACHED_PROCESS = 0x00000008
+CREATE_NO_WINDOW = 0x08000000
+
+
 
 class SystemMonitor:
     def __init__(self, root):
+        # 初始化 WMI 连接
+        self.wmi_connection = None
+        self.initialize_wmi()
+
         self.root = root
         self.root.title("SysPulse")
         self.root.resizable(True, True)
@@ -62,11 +75,24 @@ class SystemMonitor:
         self.needs_mouse_penetration_update = False
         # 添加透明度变量
         self.transparency_var = tk.IntVar(value=255)  # 255为完全不透明
+        # 添加cpu温度错误计数器
+        self.cpu_temp_error_count = 0
+        self.max_temp_errors = 3
+        self.disable_temp_monitoring = False
         # 启动主界面并读取配置文件
         self.create_widgets()
         self.load_config()
 
-        # Start threads for system info, network speed, and resource usage
+        # 启动线程之前，确保主窗口是隐藏的。
+        self.root.after(100, self.start_threads)  # 延迟启动线程以确保初始化完成了
+
+        self.root.after(100, self.adjust_window_size)
+
+        # Process queue to update UI from threads
+        self.root.after(100, self.process_queue)
+
+    # 定义一个新的方法用于启动线程
+    def start_threads(self):
         self.system_thread = Thread(target=self.update_system_info)
         self.system_thread.daemon = True
         self.system_thread.start()
@@ -79,19 +105,20 @@ class SystemMonitor:
         self.resource_thread.daemon = True
         self.resource_thread.start()
 
-        self.root.after(100, self.adjust_window_size)
+    def initialize_wmi(self):
+        # pass
+        # 初始化WMI连接"""
+        try:
+            pythoncom.CoInitialize()
+            self.wmi_connection = wmi.WMI(namespace=r"root\OpenHardwareMonitor")
+            pass
+        except Exception as e:
+            # print(f"Error initializing WMI connection: {e}")
+            self.wmi_connection = None
 
-        # Process queue to update UI from threads
-        self.root.after(100, self.process_queue)
-
-        # Create system tray icon
-        self.create_system_tray()
-      
     def create_widgets(self):
         # 获取主窗口的句柄
         self.root.update()  # 确保窗口已经创建
-        # self.main_hwnd = win32gui.GetForegroundWindow() # 使用GetForegroundWindow获取当前前台窗口句柄
-        # self.main_hwnd = self.root.winfo_id()  # 直接获取Tkinter主窗口的ID，而不是通过窗口标题
         self.main_hwnd = win32gui.FindWindow(None, self.root.title())  # 根据窗口标题获取句柄
 
         self.main_frame = ttk.Frame(self.root, padding="20", style='TFrame')
@@ -199,7 +226,7 @@ class SystemMonitor:
             with open('translations.json', 'r', encoding='utf-8') as file:
                 return json.load(file)
         except (FileNotFoundError, json.JSONDecodeError) as e:
-            print(f"Error loading translations: {e}, using default translations")
+            # print(f"Error loading translations: {e}, using default translations")
             return self.get_default_translations()
         
     def get_default_translations(self):
@@ -278,7 +305,8 @@ class SystemMonitor:
             self.style.configure('TCheckbutton', font=("SF Pro Text", size))
             self.style.configure('TCombobox', font=("SF Pro Text", size))
         except ValueError:
-            print("Invalid font size")
+            # print("Invalid font size")
+            pass
     
     def update_transparency(self, *args):
         # 更新窗口透明度
@@ -345,42 +373,104 @@ class SystemMonitor:
         return platform.processor()
 
     def get_cpu_temperature(self):
+        # 如果已经禁用了温度监控，直接返回N/A
+        if self.disable_temp_monitoring:
+            return 'N/A'
+            
+        if self.wmi_connection is None:
+            self.cpu_temp_error_count += 1
+            if self.cpu_temp_error_count >= self.max_temp_errors:
+                self.disable_temp_monitoring = True
+                # print("CPU temperature monitoring has been disabled after multiple failures")
+            return 'N/A'
+            
         try:
-            pythoncom.CoInitialize()
-            c = wmi.WMI(namespace=r"root\OpenHardwareMonitor")
-            temperature_infos = c.Sensor(SensorType='Temperature', Parent='CPU')
-            return temperature_infos[0].Value if temperature_infos else 'N/A'
-        except Exception as e:
-            print(f"Error getting CPU temperature via OpenHardwareMonitor: {e}")
-            try:
-                c = wmi.WMI(namespace=r"root\cimv2")
-                temperature_infos = c.query("SELECT * FROM Win32_TemperatureProbe")
-                return temperature_infos[0].CurrentReading if temperature_infos else 'N/A'
-            except Exception as e:
-                print(f"Error getting CPU temperature via Win32_TemperatureProbe: {e}")
+            temperature_infos = self.wmi_connection.Sensor(SensorType='Temperature', Parent='CPU')
+            if temperature_infos:
+                # 成功获取温度，重置错误计数
+                self.cpu_temp_error_count = 0
+                return temperature_infos[0].Value
+            else:
+                self.cpu_temp_error_count += 1
+                if self.cpu_temp_error_count >= self.max_temp_errors:
+                    self.disable_temp_monitoring = True
+                    # print("CPU temperature monitoring has been disabled after multiple failures")
                 return 'N/A'
+        except Exception as e:
+            # print(f"Error getting CPU temperature: {e}")
+            self.cpu_temp_error_count += 1
+            if self.cpu_temp_error_count >= self.max_temp_errors:
+                self.disable_temp_monitoring = True
+                # print("CPU temperature monitoring has been disabled after multiple failures")
+            return 'N/A'
+        # return 'N/A'
 
-    def update_system_info(self):
-        cpu_name = self.get_cpu_name()
-        while True:
+    def get_gpu_info(self):
+        # 改进的GPU信息获取方法
+        try:
+            # 设置CUDA_DEVICE_ORDER环境变量
+            os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+            
+            # 指定GPU设备ID
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]
+                return gpu.name, gpu.load * 100, gpu.temperature
+            return 'N/A', 'N/A', 'N/A'
+        except Exception as e:
+            # print(f"Error getting GPU info: {e}")
+            return 'N/A', 'N/A', 'N/A'
+    
+    def get_cpu_info(self):
+        try:
             cpu_usage = psutil.cpu_percent(interval=1)
-            cpu_temp = self.get_cpu_temperature()
+        except Exception as e:
+            # print(f"Error getting CPU usage: {e}")
+            cpu_usage = 'N/A'
+        
+        return cpu_usage
 
+    def get_memory_info(self):
+        try:
             memory_info = psutil.virtual_memory()
             total_memory = memory_info.total / (1024 ** 3)
             used_memory = memory_info.used / (1024 ** 3)
             memory_percent = memory_info.percent
+        except Exception as e:
+            # print(f"Error getting memory info: {e}")
+            total_memory = used_memory = memory_percent = 'N/A'
+        
+        return total_memory, used_memory, memory_percent
 
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu = gpus[0]
-                gpu_usage = gpu.load * 100
-                gpu_temp = gpu.temperature
-                gpu_name = gpu.name
-            else:
-                gpu_usage = gpu_temp = gpu_name = 'N/A'
-
-            self.queue.put(lambda: self.update_labels(cpu_name, cpu_usage, cpu_temp, used_memory, total_memory, memory_percent, gpu_name, gpu_usage, gpu_temp))
+    def update_system_info(self):
+        cpu_name = platform.processor()
+        
+        while True:
+            try:
+                cpu_usage = psutil.cpu_percent(interval=2)
+                
+                # 只有在未禁用的情况下才获取CPU温度
+                cpu_temp = self.get_cpu_temperature() if not self.disable_temp_monitoring else 'N/A'
+                
+                memory = psutil.virtual_memory()
+                total_memory = memory.total / (1024 ** 3)
+                used_memory = memory.used / (1024 ** 3)
+                memory_percent = memory.percent
+                
+                gpu_name, gpu_usage, gpu_temp = self.get_gpu_info()
+                
+                self.queue.put(lambda: self.update_labels(
+                    cpu_name, cpu_usage, cpu_temp,
+                    used_memory, total_memory, memory_percent,
+                    gpu_name, gpu_usage, gpu_temp
+                ))
+                
+                time.sleep(1)
+            except Exception as e:
+                # print(f"Error in update_system_info: {e}")
+                time.sleep(1)
 
     def update_labels(self, cpu_name, cpu_usage, cpu_temp, used_memory, total_memory, memory_percent, gpu_name, gpu_usage, gpu_temp):
         updates = [
@@ -407,12 +497,17 @@ class SystemMonitor:
     def update_network_speed(self):
         old_value = psutil.net_io_counters()
         while True:
-            time.sleep(1)
-            new_value = psutil.net_io_counters()
-            download_speed = (new_value.bytes_recv - old_value.bytes_recv) / 1024  # KB/s
-            upload_speed = (new_value.bytes_sent - old_value.bytes_sent) / 1024  # KB/s
-            self.queue.put(lambda: self.update_network_labels(download_speed, upload_speed))
-            old_value = new_value
+            try:
+                time.sleep(2)  # 增加间隔时间
+                new_value = psutil.net_io_counters()
+                download_speed = (new_value.bytes_recv - old_value.bytes_recv) / 2048  # KB/s
+                upload_speed = (new_value.bytes_sent - old_value.bytes_sent) / 2048  # KB/s
+                
+                self.queue.put(lambda: self.update_network_labels(download_speed, upload_speed))
+                old_value = new_value
+            except Exception as e:
+                # print(f"Error in update_network_speed: {e}")
+                time.sleep(1)
 
     def update_network_labels(self, download_speed, upload_speed):
         if self.network_speed_var.get():
@@ -440,11 +535,18 @@ class SystemMonitor:
             self.download_label.grid_remove()
             self.upload_label.grid_remove()
     def update_resource_usage(self):
+        process = psutil.Process(os.getpid())
         while True:
-            process = psutil.Process(os.getpid())
-            cpu_usage = process.cpu_percent(interval=1)
-            memory_usage = process.memory_info().rss / (1024 ** 2)  # MB
-            self.queue.put(lambda: self.update_resource_label(cpu_usage, memory_usage))
+            try:
+                # 使用更大的interval减少刷新频率
+                cpu_usage = process.cpu_percent(interval=2)
+                memory_usage = process.memory_info().rss / (1024 ** 2)  # MB
+                
+                self.queue.put(lambda: self.update_resource_label(cpu_usage, memory_usage))
+                time.sleep(1)
+            except Exception as e:
+                # print(f"Error in update_resource_usage: {e}")
+                time.sleep(1)
 
     def update_resource_label(self, cpu_usage, memory_usage):
         if self.monitor_resource_usage_var.get():
@@ -458,17 +560,27 @@ class SystemMonitor:
         self.root.geometry('')
 
     def create_system_tray(self):
-        menu = Menu(
-            MenuItem('Setting', self.open_settings),
-            MenuItem('Toggle Mouse Penetration', self.toggle_mouse_penetration_menu),
-            MenuItem('Show', self.show_window),
-            MenuItem('Exit', self.quit_window)
-        )
-        # image = Image.new('RGB', (64, 64), color=(200, 100, 90))
-        image = Image.open('qcf.jpg')
-        self.icon = Icon("name", image, "SysPulse", menu)
-        self.icon_thread = Thread(target=self.icon.run)
-        self.icon_thread.start()
+        try:
+            menu = Menu(
+                MenuItem('Setting', self.open_settings),
+                MenuItem('Toggle Mouse Penetration', self.toggle_mouse_penetration_menu),
+                MenuItem('Show', self.show_window),
+                MenuItem('Exit', self.quit_window)
+            )
+            
+            # 使用异常处理确保图片加载
+            try:
+                image = Image.open('qcf.jpg')
+            except Exception:
+                # 如果无法加载图片，创建一个默认的
+                image = Image.new('RGB', (64, 64), color=(200, 100, 90))
+            
+            self.icon = Icon("name", image, "SysPulse", menu)
+            self.icon_thread = Thread(target=self.icon.run, daemon=True)
+            self.icon_thread.start()
+        except Exception as e:
+            # print(f"Error creating system tray: {e}")
+            pass
 
     def toggle_mouse_penetration_menu(self):
         self.mouse_penetrate_var.set(not self.mouse_penetrate_var.get())
@@ -575,12 +687,27 @@ class SystemMonitor:
         self.root.after(100, self.process_queue)
 
     def run(self):
-        # 启动主循环
-        self.root.mainloop()
-        # 绑定关闭窗口时的操作
-        self.root.protocol("WM_DELETE_WINDOW", self.quit_window())
+        try:
+            # 设置关闭窗口的处理
+            self.root.protocol("WM_DELETE_WINDOW", self.quit_window)
+            self.root.deiconify()  # 初始化完成后显示窗口
+            # 确保在窗口完全显示后再创建系统托盘
+            self.create_system_tray()
+            # 启动主循环
+            self.root.mainloop()
+        except Exception as e:
+            # print(f"Error in main loop: {e}")
+            self.quit_window()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = SystemMonitor(root)
-    app.run()
+    multiprocessing.freeze_support()
+    try:
+        root = tk.Tk()
+        root.withdraw()  # 隐藏主窗口，直到完全初始化
+        app = SystemMonitor(root)
+        root.deiconify()  # 初始化完成后显示窗口
+        app.run()
+
+    except Exception as e:
+        # print(f"Fatal error: {e}")
+        sys.exit(1)
