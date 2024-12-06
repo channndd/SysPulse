@@ -196,8 +196,7 @@ class SystemMonitor:
             ('monitor_resource_usage_var', "Monitor Resource Usage: ")
         ]:
             ttk.Checkbutton(main_frame, text=self.translate(text), variable=getattr(self, var_name), style='TCheckbutton').pack(anchor="w", pady=2)    
-        
-        
+         
         ttk.Checkbutton(main_frame, text=self.translate("Show Settings Button"), variable=self.show_settings_button_var, command=self.toggle_settings_button_visibility, style='TCheckbutton').pack(pady=(10, 5), anchor='w')
         ttk.Button(main_frame, text=self.translate("Save Settings"), command=self.save_config, style='TButton').pack(pady=(20, 0), fill='x')
 
